@@ -5,77 +5,111 @@
 
 from machine import Pin, I2C
 import time, os
-from rtc_ds3231 import DS3231
 
-# --- Configuration matérielle ---
-I2C_ID = 1
-PIN_SDA = 14
-PIN_SCL = 15
-BUTTON_PIN = 16   # Broche du bouton (actif bas)
-LOG_PATH = "log.txt"
+#  Classe de gestion du module RTC DS3231 
+class DS3231:
+    def __init__(self, i2c, addr=0x68):
+        # Initialise la communication I2C avec l’adresse par défaut du DS3231 (0x68)
+        self.i2c, self.addr = i2c, addr
 
-# --- Initialisation du bus I2C et du RTC ---
-i2c = I2C(I2C_ID, sda=Pin(PIN_SDA), scl=Pin(PIN_SCL), freq=400000)
-rtc = DS3231(i2c)
+    def _bcd(self, x, rev=False):
+        
+        # Conversion BCD (Binary Coded Decimal)
+        
+        # rev=False : transforme une valeur décimale en BCD
+        
+        # rev=True  : transforme une valeur BCD lue depuis le RTC en décimal
+        
+        return (x//10<<4 | x%10) if not rev else (x>>4)*10 + (x & 0x0F)
 
-# --- Initialisation du bouton ---
-btn = Pin(BUTTON_PIN, Pin.IN, Pin.PULL_UP)
+    def get(self):
+        
+        # Lit les 7 registres de temps du DS3231 (secondes → année)
+        
+        d = self.i2c.readfrom_mem(self.addr, 0, 7)
+        
+        # Conversion des 3 premiers octets (secondes, minutes, heures) depuis le format BCD
+        
+        s, m, h = [self._bcd(x, 1) for x in d[:3]]
+        # Conversion de la date (jour, mois, année)
+        Y, M, D = 2000+self._bcd(d[6], 1), self._bcd(d[5]&0x1F, 1), self._bcd(d[4], 1)
+        return Y, M, D, h, m, s
 
-def attendre_appui(message="Appuyez sur le bouton..."):
-    """Attend que le bouton soit pressé puis relâché (avec anti-rebond)."""
-    print(message)
-    # Attendre l’appui
-    while btn.value() == 1:
-        time.sleep_ms(10)
-    # Attendre le relâchement
-    while btn.value() == 0:
-        time.sleep_ms(10)
+    def now(self):
+        # Renvoie la date et l’heure actuelles sous forme de chaîne formatée
+        Y, M, D, h, m, s = self.get()
+        return f"{Y:04}-{M:02}-{D:02} {h:02}:{m:02}:{s:02}"
 
-def initialiser_log(f):
-    """Ajoute un en-tête au fichier log si nécessaire."""
-    try:
-        taille = os.stat(LOG_PATH)[6]
-        if taille == 0:
-            f.write("timestamp,temps_ecoule\n")
-            f.flush()
-    except:
+    def sec_midnight(self):
+        # Calcule le nombre de secondes écoulées depuis minuit
+        _, _, _, h, m, s = self.get()
+        return h*3600 + m*60 + s
+
+
+# Configuration matérielle 
+i2c = I2C(1, sda=Pin(14), scl=Pin(15))   # Bus I2C utilisé (canal 1, broches 14 et 15)
+
+rtc = DS3231(i2c)                        # Création d’un objet DS3231 pour accéder au RTC
+
+btn = Pin(22, Pin.IN, Pin.PULL_DOWN)     # Bouton poussoir relié à la broche GPIO 22
+
+LOG = "log.txt"                          # Nom du fichier journal
+
+def wait_press(msg="Appuyez..."):
+    
+    """Attend une pression et un relâchement du bouton (anti-rebond simple)."""
+    print(msg)
+    
+    while btn.value(): time.sleep_ms(10)     # Attente de l’appui
+        
+    while not btn.value(): time.sleep_ms(10) # Attente du relâchement
+
+def init_log(f):
+    """Crée le fichier log avec un en-tête s’il n’existe pas encore."""
+    
+    if not LOG in os.listdir() or os.stat(LOG)[6]==0:
+        
         f.write("timestamp,temps_ecoule\n")
-        f.flush()
 
-def mesurer_jeu():
-    """Effectue une partie du jeu et retourne le temps écoulé."""
-    attendre_appui("Appuyez pour commencer à compter 15 secondes...")
-    debut = rtc.seconds_since_midnight()
-    attendre_appui("Appuyez de nouveau quand vous pensez que 15 secondes sont passées.")
-    fin = rtc.seconds_since_midnight()
+def play():
+    """Lance une partie du jeu des 15 secondes et retourne le temps écoulé."""
+    
+    wait_press("Appuyez pour démarrer (15s)...")
+    
+    t0 = rtc.sec_midnight()        # Heure de départ (en secondes depuis minuit) 
+    
+    wait_press("Appuyez quand terminé.")
+    t1 = rtc.sec_midnight()                 # Heure d’arrêt
+    
+    if t1 < t0: t1 += 86400                # Gestion du passage à minuit (ajoute 24h en secondes)
+        
+    return rtc.now(), t1 - t0            # Retourne (horodatage, durée)
 
-    # Gestion du passage de minuit
-    if fin < debut:
-        fin += 24 * 3600
+# Programme principal 
 
-    ecoule = fin - debut
-    return rtc.datetime_string(), ecoule
+print("=== Jeu des 15 secondes ===")
 
-def main():
-    print("=== Jeu des 15 secondes ===")
-    print("Adresses I2C détectées :", [hex(a) for a in i2c.scan()])
-    print("Heure actuelle du RTC :", rtc.datetime_string())
-    print("Appuyez sur Ctrl+C pour arrêter le programme.\n")
+print("I2C détecté :", [hex(a) for a in i2c.scan()])   # Vérifie la présence du module RTC
 
-    log = open(LOG_PATH, "a")
+print("Heure RTC :", rtc.now())
+
+with open(LOG, "a") as f:
+    
+    init_log(f)
+    
     try:
-        initialiser_log(log)
         while True:
-            horodatage, ecoule = mesurer_jeu()
-            print(f"Temps mesuré : {ecoule} secondes")
-            log.write(f"{horodatage},{ecoule}\n")
-            log.flush()
-            print("-------------------------------\n")
+            ts, d = play() 
+            
+            print(f"→ {d}s\n")           # Affiche la durée sur la console
+            
+            f.write(f"{ts},{d}\n")       # Sauvegarde dans le fichier log
+            
+            f.flush()
+            
     except KeyboardInterrupt:
-        print("\nArrêt du programme par l'utilisateur.")
-    finally:
-        log.close()
-        print("Fichier journal enregistré :", LOG_PATH)
+        
+        # Interruption par l’utilisateur (Ctrl+C)
+        
+        print("Arrêt, log sauvegardé :", LOG)
 
-if __name__ == "__main__":
-    main()
